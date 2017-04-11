@@ -1,0 +1,102 @@
+#
+# This is generated automatically by $MAXCOMPILERDIR/lib/MaxIDE/projectAdmin.jar every time 
+# RunRule.settings is updated.  Changes to this files are likely to be lost.
+#
+
+ifndef MAXCOMPILERDIR
+  $(error The MAXCOMPILERDIR environment variable is not set)
+endif
+
+# HW only XXX
+ifndef MAXELEROSDIR
+        $(error The MAXELEROSDIR environment variable is not set)
+endif
+
+
+export ANT_MAXELER_INTERNAL_MAXIDE_JARS = $(subst :,;,$(MAXELER_INTERNAL_MAXIDE_JARS))
+
+# include custom definitions before including MAXCOMPILER include file
+include Makefile.settings
+
+IS_SIMULATION_PROFILE := 0
+IS_HARDWARE_PROFILE := 1
+
+ifeq ($(IS_SIMULATION_PROFILE),1)
+  MAXELEROSDIR=$(MAXCOMPILERDIR)/lib/maxeleros-sim
+endif
+
+
+MAXCOMPILER_BUILD_DIR ?= $(shell pwd)/maxfiles
+export MAXCOMPILER_BUILD_DIR
+
+MAXELEROSDIR_SIM:=$(MAXCOMPILERDIR_QUOTE)/lib/maxeleros-sim
+
+
+export MAXCOMPILER_BUILD_CONF = build.copy_results_to=$(shell pwd)/maxfiles
+export MAXCOMPILER_ACTIVITY_FILE = $(shell pwd)/.maxcompiler-activity.be
+
+#
+# 'all' needs to be the first target (dummy)
+#
+all:
+
+MAXFILES_MAX = $(patsubst %.max,maxfiles/%.max, $(RUNRULE_MAXFILES))
+MAXFILES_H   = $(patsubst %.h,include/%.max, $(RUNRULE_MAXFILES_H))
+
+build: maxfiles
+
+
+maxfiles: $(MAXFILES_MAX)
+
+#
+# MaxFile: LocExtHWFixEVTOpt
+#
+
+
+BUILDNAME_MAXFILE_1:=LocExtHWFixEVTOpt
+MAXFILE_1:=LocExtHWFixEVTOpt.max
+
+include/LocExtHWFixEVTOpt.h: maxfiles/LocExtHWFixEVTOpt.h
+	cp $< $@
+
+maxfiles/LocExtHWFixEVTOpt.max maxfiles/LocExtHWFixEVTOpt.h:
+# Ensure that maxfiles do not get build by this Makefile when running in MaxIDE
+ifndef MAXIDE_RUN
+	env  MAX_BUILDPARAMS=" DFEModel=VECTIS  target=DFE  maxFileName=LocExtHWFixEVTOpt "  ant -v -f LocExtHWFixEVTOpt.xml
+else
+	test -f $@ || ( echo 'Maxfile unavailable: $@' >/dev/stderr ; exit 1 )
+endif
+
+
+
+startsim:
+		true
+
+stopsim:
+		true
+
+clean: clean-dist clean-objects clean-installers
+distclean: clean clean-maxfiles
+
+clean-dist:
+	@echo Cleaning dist
+	@-if test -d dist; then find dist -type f -! -wholename '*/\.*' -exec $(RM) {} \; ; fi
+
+clean-objects:
+	@echo Cleaning objects
+	@-if test -d objects; then find objects -type f -! -wholename '*/\.*' -exec $(RM) {} \; ; fi
+
+clean-maxfiles:
+	@echo Cleaning maxfiles
+	@-if test -d maxfiles; then find maxfiles -type f -! -wholename '*/\.*' -exec $(RM) {} \; ; fi
+
+clean-installers:
+	@echo Cleaning installers
+	@-if test -d installers; then find installers -type f -! -wholename '*/\.*' -exec $(RM) {} \; ; fi
+
+.PRECIOUS: $(patsubst %.max,maxfiles/%.max, $(RUNRULE_MAXFILES)) \
+           $(patsubst %.max,maxfiles/%.h, $(RUNRULE_MAXFILES))   \
+           $(patsubst %.max,include/%.h, $(RUNRULE_MAXFILES))
+
+.PHONY: startsim stopsim build clean maxfiles clean-dist clean-objects clean-maxfiles clean-installers
+

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<maxCompilerManager version="2">
+<enginePart internalEngineSubproject="FixAESKeySchedule_EngineCode" isSrcBin="false" isUseDefaultSelected="false" outputLocation="/FixAESKeySchedule_EngineCode/bin" projectName="FixAESKeySchedule"/>
+<cpuPart internalCpuSubproject="FixAESKeySchedule_CPUCode"/>
+<watchedFiles/>
+</maxCompilerManager>

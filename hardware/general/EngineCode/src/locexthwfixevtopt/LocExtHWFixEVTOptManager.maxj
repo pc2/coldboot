@@ -1,0 +1,111 @@
+/*
+ * Copyright (c) 2013-2017 Paderborn Center for Parallel Computing
+ * Copyright (c) 2014-2015 Robert Mittendorf
+ * Copyright (c) 2013      Heinrich Riebler
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+package locexthwfixevtopt;
+
+import com.maxeler.maxcompiler.v2.build.EngineParameters;
+import com.maxeler.maxcompiler.v2.managers.BuildConfig;
+import com.maxeler.maxcompiler.v2.managers.BuildConfig.Effort;
+import com.maxeler.maxcompiler.v2.managers.custom.CustomManager;
+import com.maxeler.maxcompiler.v2.managers.custom.blocks.StateMachineBlock;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.CPUTypes;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.InterfaceParam;
+
+public class LocExtHWFixEVTOptManager extends CustomManager {
+  // Name prefix for SMs.
+  private static final String s_smName = "AESFixEVTSM";
+  // Number of SMs.
+  private static final int i_smNum = 1;
+
+  public LocExtHWFixEVTOptManager(EngineParameters engineParams) {
+    super(engineParams);
+    // Create SM block.
+    StateMachineBlock[] stateMachine = new StateMachineBlock[i_smNum];
+    // Set interval.
+    int interval = 256 / i_smNum;
+
+    // Add instances.
+    for(int i=0; i<i_smNum; i++) {
+      stateMachine[i] = addStateMachine(s_smName+i, new AESKeyFixEVT_SM(this, i*interval, (i+1)*interval-1, i));
+      // Wire with host i/O streams
+      stateMachine[i].getInput(AESKeyFixEVT_SM.IO_IN_DATA) <== addStreamFromCPU(AESKeyFixEVT_SM.IO_IN_DATA+i);
+      addStreamToCPU(AESKeyFixEVT_SM.IO_OUT_DATA+i) <== stateMachine[i].getOutput(AESKeyFixEVT_SM.IO_OUT_DATA);
+    }
+  }
+
+  private static EngineInterface interfaceDefault() {
+    EngineInterface ei = new EngineInterface();
+    // Generate SLiC-Interface for I/O.
+    InterfaceParam N = ei.addParam("N", CPUTypes.INT);
+
+    for(int i=0; i<i_smNum; i++) {
+      ei.setStream(AESKeyFixEVT_SM.IO_IN_DATA+i,  CPUTypes.UINT8, CPUTypes.UINT8.sizeInBytes() * N);
+      ei.setStream(AESKeyFixEVT_SM.IO_OUT_DATA+i, CPUTypes.UINT8, 192);
+      ei.setScalar(s_smName+i, "pollID", 0);
+    }
+
+    return ei;
+  }
+
+  private static EngineInterface pollResult() {
+    EngineInterface ei = new EngineInterface("pollResult");
+    InterfaceParam pollID = ei.addParam("pollID", CPUTypes.UINT64);
+    ei.ignoreAll(EngineInterface.Direction.IN_OUT);
+
+    for (int i = 0; i < i_smNum; i++) {
+      ei.setStream(AESKeyFixEVT_SM.IO_OUT_DATA+i, CPUTypes.UINT8, 192);
+      ei.setScalar(s_smName+i, "pollID", pollID);
+    }
+
+    return ei;
+  }
+
+  public static void main(String[] args) {
+    EngineParameters params = new EngineParameters(args);
+    BuildConfig buildConf = params.getBuildConfig();
+    LocExtHWFixEVTOptManager m = new LocExtHWFixEVTOptManager(params);
+    // Enables multi-pass place and route with a
+    // range of cost tables from min to max.
+    int costTableMin = 1;
+    int costTableMax = 100;
+    int costTableParallelism = Math.min(costTableMax-costTableMin+1, 6);
+    buildConf.setMPPRCostTableSearchRange(costTableMin, costTableMax);
+    // Specifies the number of place and route
+    // processes to run in parallel
+    buildConf.setMPPRParallelism(costTableParallelism);
+    // Sets the effort level for the Xilinx place and route tools.
+    buildConf.setBuildEffort(Effort.HIGH);
+    //		buildConf.setBuildEffort(Effort.VERY_HIGH);
+    // Description: sets the default clock frequency for Manager blocks.
+    // When to use: Increase this to improve performance. Decrease
+    //                this to meet timing.
+    m.config.setDefaultStreamClockFrequency(60);
+    m.setBuildConfig(buildConf);
+    //		m.setBuildConfig(new BuildConfig(Level.FULL_BUILD));
+    m.createSLiCinterface(interfaceDefault());
+    m.createSLiCinterface(pollResult());
+    m.build();
+  }
+}

@@ -1,0 +1,3004 @@
+/*
+ * Copyright (c) 2013-2017 Paderborn Center for Parallel Computing
+ * Copyright (c) 2014-2015 Robert Mittendorf
+ * Copyright (c) 2013      Heinrich Riebler
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+package locexthwfixevtopt;
+
+import java.util.ArrayList;
+
+import com.maxeler.maxcompiler.v2.managers.DFEManager;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmAssignableValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmSinglePortMappedROM;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmSinglePortROM;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateEnum;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmValue;
+import com.maxeler.maxcompiler.v2.statemachine.Latency;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPullInput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.DFEsmPushOutput;
+import com.maxeler.maxcompiler.v2.statemachine.manager.ManagerStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+
+public class AESKeyFixEVT_SM extends ManagerStateMachine {
+// Public IO, reused in Manager.
+static public final String IO_IN_DATA  = "input";
+static public final String IO_OUT_DATA = "output";
+
+// State machine main modes.
+enum Modes {
+	// Initiation stuff.
+	INIT,
+	// Guess byte for position (0..255).
+	GUESS_STAGE_BYTE,
+	// Save state on stack.
+	STATE_PUSH,
+	// Recover state from stack.
+	STATE_POP,
+	// Compute complete key schedule from round 8.
+	COMPLETE_FROM8,
+	// Verify final number of errors.
+	FINAL_CHECK,
+	// No result.
+	RESULT_NO,
+	// Computation done.
+	RESULT_DONE,
+	// Exit.
+	SYSTEM_EXIT
+}
+
+private final int NUMBER_OF_SM=4;
+
+// Types.
+private final DFEsmValueType typeByte = dfeUInt(8);
+private final DFEsmValueType typeError = dfeInt(10);
+private final DFEsmValueType typeStage = dfeUInt(5);
+private final DFEsmValueType typeBoolean = dfeBool();
+private final DFEsmValueType typeUInt64 = dfeUInt(64);
+private final DFEsmValueType typeBetterGuessROMAddress = dfeUInt(12);
+
+
+// Helper.
+//  - Number of bytes in whole key schedule.
+private static final int KEY_SIZE = 176;
+//  - Number of bytes in each round.
+private static final int NUM_BYTES = 16;
+//  - Number of rounds.
+private static final int NUM_ROUNDS = 11;
+
+// I/O.
+private final DFEsmPullInput input;
+private final DFEsmPushOutput output;
+
+private final DFEsmStateValue clkCnt;
+
+private final DFEsmInput expected_n0;
+private final DFEsmInput expected_n1;
+
+// State.
+//multi-state SM. These values are needed for every submachine
+// - Current main mode.
+private final ArrayList<DFEsmStateEnum<Modes>>sMode;
+//
+// - Current stage.
+private final DFEsmStateValue[] sStage;
+private final DFEsmStateValue[] maxStage;
+// - Current guessing byte.
+private final DFEsmStateValue[] sNextGuessIndex;
+// Candidate Key Schedule.
+private final DFEsmStateValue[][] ksC;
+
+// - Flag to control recovery on incompatible
+//     assignments.
+private final DFEsmStateValue[] sFlagRecover;
+
+// Recovery Stack.
+// Key Schedule Candidate and guessing byte.
+private final DFEsmStateValue[][][] recS_C;
+private final DFEsmStateValue[][] recS_sNextGuessIndex;
+private final DFEsmStateValue[][] recS_n0;
+private final DFEsmStateValue[][] recS_n1;
+
+// ValidityExaminer_ExpectedValueAsThreshold
+private final DFEsmStateValue[] n0;
+private final DFEsmStateValue[] n1;
+private final DFEsmStateValue[] sCurrentN0;
+private final DFEsmStateValue[] sCurrentN1;
+
+// ROMs.
+private final DFEsmSinglePortROM[] romSbox;
+private final DFEsmSinglePortROM[] romUnSbox;
+private final DFEsmSinglePortMappedROM[] romBetterGuess;
+// - Flags to control memory request/response.
+//     to wait for memory.
+private final DFEsmStateValue[][] sFlagMem;
+
+//if (NUMBER_OF_SM > 1){
+	// New for Coordinated Stack Access
+	private final DFEsmStateValue[] topOfStack;
+	//BOS: indicates the stage of the oldest working packet which has not been stolen yet
+	private final DFEsmStateValue[] bottomOfStack;
+	private final DFEsmStateValue[] idleNoResult;
+
+//}
+
+	//if Better Guess ROM is used
+	private final DFEsmStateValue[] sValueBackupOnPush;
+// - Control output/input data/flags
+private final DFEsmStateValue sReadDataReady;
+// - Current count (to read input).
+private final DFEsmInput pollID;
+private final DFEsmStateValue lastPollID;
+private final DFEsmStateValue outValid;
+private final DFEsmStateValue byteOut;
+private final DFEsmStateValue sendingReply;
+private final DFEsmStateValue sCounterIn;
+private final DFEsmStateValue sCounterOut;
+
+// Decay Key Schedule.
+private final DFEsmStateValue[] ksD;
+
+// Interval for several SMs.
+private final int sGuessIndexStart;
+private final int sGuessIndexEnd;
+private final int smID;
+
+/**
+* Init state variables.
+*
+* @param owner
+*/
+protected AESKeyFixEVT_SM(DFEManager owner, int sGuessIndexStart, int sGuessIndexEnd, int smID) {
+super(owner);
+
+// Set guessing interval for first tree level.
+this.sGuessIndexStart = sGuessIndexStart;
+this.sGuessIndexEnd = sGuessIndexEnd;
+this.smID = smID;
+
+// I/O.
+// Set up inputs/outputs
+input = io.pullInput("input", typeByte);
+output = io.pushOutput("output", typeByte, 64);
+
+clkCnt = state.value(typeUInt64, 0);
+
+// State.
+//for In-/Output (needed only once)
+sCounterIn = state.value(typeByte, 0);
+sCounterOut = state.value(typeByte, 0);
+sReadDataReady = state.value(typeBoolean, false);
+pollID = io.scalarInput("pollID", typeUInt64);
+lastPollID = state.value(typeUInt64, Long.MAX_VALUE);
+byteOut = state.value(typeByte, 0);
+outValid = state.value(typeBoolean, 0);
+sendingReply = state.value(typeBoolean, 0);
+
+//initialize variables which are needed once per submachine
+		sMode = new ArrayList<DFEsmStateEnum<Modes>>(NUMBER_OF_SM);
+		//ArrayList needed, due to Generic Type of DFEsmStateEnum<Modes>:
+		//Not allowed:
+		//sMode = new DFEsmStateEnum<Modes> [NUMBER_OF_SM];
+		//sMode = new Memory[NUMBER_OF_SM];
+		sStage = new DFEsmStateValue[NUMBER_OF_SM];
+		maxStage = new DFEsmStateValue[NUMBER_OF_SM];
+		sNextGuessIndex = new DFEsmStateValue[NUMBER_OF_SM];
+		
+		//sMode[0]=state.enumerated(Modes.class, Modes.INIT);
+		sMode.add(0, state.enumerated(Modes.class, Modes.INIT));
+		for (int i=1;i< NUMBER_OF_SM;i++){
+			//sMode[i]=state.enumerated(Modes.class, Modes.STATE_POP);
+			sMode.add(i, state.enumerated(Modes.class, Modes.STATE_POP));
+		}
+		for (int SMID=0;SMID< NUMBER_OF_SM;SMID++){
+			sStage[SMID] = state.value(typeStage, 0);
+			maxStage[SMID] = state.value(typeStage, 0);
+			sNextGuessIndex[SMID] = state.value(typeBetterGuessROMAddress, this.sGuessIndexStart);
+		}
+		
+		// Boolean Flag for Recovery.
+		sFlagRecover = new DFEsmStateValue[NUMBER_OF_SM];
+		// Boolean Flag for Recovery.
+		for (int SMID=0; SMID< NUMBER_OF_SM; SMID++){
+			sFlagRecover[SMID] = state.value(typeBoolean, false);
+		}
+		
+		// Recovery Stack States.
+		recS_C = new DFEsmStateValue[NUMBER_OF_SM][NUM_BYTES][KEY_SIZE];
+		recS_sNextGuessIndex = new DFEsmStateValue[NUMBER_OF_SM][NUM_BYTES];
+		recS_n0 = new DFEsmStateValue[NUMBER_OF_SM][NUM_BYTES];
+		recS_n1 = new DFEsmStateValue[NUMBER_OF_SM][NUM_BYTES];
+
+		// ValidityExaminer_ExpectedValueAsThreshold
+		n0 = new DFEsmStateValue[NUMBER_OF_SM];
+		n1 = new DFEsmStateValue[NUMBER_OF_SM];
+		sCurrentN0 = new DFEsmStateValue[NUMBER_OF_SM];
+		sCurrentN1 = new DFEsmStateValue[NUMBER_OF_SM];
+
+		//(Un)SBox Roms
+		sFlagMem = new DFEsmStateValue[NUMBER_OF_SM][4];
+		romUnSbox = new DFEsmSinglePortROM [NUMBER_OF_SM];
+		romSbox = new DFEsmSinglePortROM [NUMBER_OF_SM];
+		romBetterGuess = new DFEsmSinglePortMappedROM [NUMBER_OF_SM];
+
+		
+		// Initiate Key Decayed Schedule with zero.
+		// Initiate Candidate Key Schedule with zero.
+		//TODO: Check whether replication of ksD improves performance, e.g. higher clock frequency possible
+		ksD = new DFEsmStateValue[KEY_SIZE];
+		ksC = new DFEsmStateValue[NUMBER_OF_SM][KEY_SIZE];
+		for (int SMID=0;SMID< NUMBER_OF_SM;SMID++){
+			for(int i=0; i<KEY_SIZE; i++) {
+				ksD[i] = state.value(typeByte, 0);
+				ksC[SMID][i] = state.value(typeByte, 0);
+			}
+			// Recovery Stack States.
+			// Initiate Recovery Stack with zero.
+
+			for(int i=0; i<NUM_BYTES; i++) {
+				for(int j=0; j<KEY_SIZE; j++) {
+					// Candidate.
+					recS_C[SMID][i][j] = state.value(typeByte, 0);
+				}
+				// Guessing byte.
+				recS_sNextGuessIndex[SMID][i] = state.value(typeBetterGuessROMAddress, 0);
+				// n0.
+				recS_n0[SMID][i] = state.value(typeError, 0);
+				// n1.
+				recS_n1[SMID][i] = state.value(typeError, 0);
+			}
+			// ValidityExaminer_ExpectedValueAsThreshold
+			n0[SMID] = state.value(typeError, 0);
+			n1[SMID] = state.value(typeError, 0);
+			sCurrentN0[SMID] = state.value(typeError, 0);
+			sCurrentN1[SMID] = state.value(typeError, 0);
+			// ROMs
+			romUnSbox[SMID] = mem.rom(typeByte, Latency.ONE_CYCLE, unsbox);
+			romSbox[SMID] = mem.rom(typeByte, Latency.ONE_CYCLE, sbox);
+romBetterGuess[SMID] = mem.romMapped("betterGuess" + SMID, typeByte, 256*16, Latency.ONE_CYCLE);
+			// Value get Helper.
+			for(int i=0; i<sFlagMem[SMID].length; i++) {
+				sFlagMem[SMID][i] = state.value(typeBoolean, false);
+			}
+		}
+
+		// New for Coordinated Stack Access
+		//ONLY NEDED IN MULTI_SM
+		//if (NUMBER_OF_SM > 1){
+			topOfStack = new DFEsmStateValue[NUMBER_OF_SM];
+			bottomOfStack = new DFEsmStateValue[NUMBER_OF_SM];
+			idleNoResult = new DFEsmStateValue[NUMBER_OF_SM];
+			for (int SMID=0; SMID< NUMBER_OF_SM; SMID++){
+				// New for Coordinated Stack Access
+				topOfStack[SMID] = state.value(typeByte, 0);
+				bottomOfStack[SMID]= state.value(typeByte, 0);
+				idleNoResult[SMID]= state.value(typeBoolean, false);
+		//	}
+		}
+		// Only needed with enabled BETTER_GUESS
+		sValueBackupOnPush = new DFEsmStateValue[NUMBER_OF_SM];
+		for (int SMID=0; SMID< NUMBER_OF_SM; SMID++){
+			sValueBackupOnPush[SMID] = state.value(typeByte, 0);
+		}
+// ValidityExaminer_ExpectedValueAsThreshold Expected Values
+expected_n0 = io.scalarInput("expected_n0", typeError);
+expected_n1 = io.scalarInput("expected_n1", typeError);
+}
+@Override
+protected void nextState() {
+// Helper.
+// Java level stage.
+int t;
+// Sbox temporary value for large switch-blocks.
+DFEsmAssignableValue tUnSbox1_1 = assignable.value(typeByte);
+DFEsmAssignableValue tUnSbox2_1 = assignable.value(typeByte);
+DFEsmAssignableValue tUnSbox3_1 = assignable.value(typeByte);
+DFEsmAssignableValue tUnSbox4_1 = assignable.value(typeByte);
+DFEsmAssignableValue tUnSbox5_1 = assignable.value(typeByte);
+DFEsmAssignableValue tUnSbox5_5 = assignable.value(typeByte);
+DFEsmAssignableValue tUnSbox6_1 = assignable.value(typeByte);
+DFEsmAssignableValue tUnSbox6_5 = assignable.value(typeByte);
+tUnSbox1_1.connect(0);
+tUnSbox2_1.connect(0);
+tUnSbox3_1.connect(0);
+tUnSbox4_1.connect(0);
+tUnSbox5_1.connect(0);
+tUnSbox5_5.connect(0);
+tUnSbox6_1.connect(0);
+tUnSbox6_5.connect(0);
+
+// Default address for ROMS.
+// To fix:
+// Tue 17:24: WARNING: Found one or more variables, e.g. input/output ports of RAM, that lack a default assignment.
+// This might trigger the generation of a latch in hardware which should be avoided. Statemachine 'TsowFixManagerStateMachine'
+// (in next state function), Types affected: smUInt(8) (signal class: 'MemoryAddress'), smUInt(8) (signal class: 'MemoryAddress')
+for (int SMID=0; SMID< NUMBER_OF_SM; SMID++){
+romUnSbox[SMID].address <== 0;
+romSbox[SMID].address <== 0;
+}
+
+// Count clock cycles since startup, stop when one SM finished
+clkCnt.next <== clkCnt + 1;
+for (int SMID = 0; SMID < NUMBER_OF_SM; SMID++) {
+IF (sMode[SMID].eq(Modes.SYSTEM_EXIT)) {
+clkCnt.next <== clkCnt;
+}
+}
+
+// Part of Poll logic
+outValid.next <== 0;
+byteOut.next <== 0;
+IF (pollID.neq(lastPollID).and(~output.stall)) {
+        sendingReply.next <== 1; // start sending
+        sCounterOut.next <== 0;
+        lastPollID.next <== pollID;
+}
+IF (sendingReply.and(~output.stall)) {
+        outValid.next <== 1;
+
+        sCounterOut.next <== sCounterOut + 1;
+        IF (sCounterOut.eq(191)) { // transfer finished
+                sendingReply.next <== 0; // stop sending
+                sCounterOut.next <== 0;
+        }
+
+        _SWITCH(sCounterOut);
+        for (int i = 0; i < 176; i++) { // output KS
+                _CASE(i);
+                for (int SMID = 0; SMID < NUMBER_OF_SM; SMID++) {
+                        IF (sMode[SMID].eq(Modes.SYSTEM_EXIT)) {
+                                byteOut.next <== ksC[SMID][i];
+                        }
+                }
+        }
+        _CASE(176);
+        byteOut.next <== clkCnt.shiftRight(0).cast(typeByte);
+        _CASE(177);
+        byteOut.next <== clkCnt.shiftRight(8).cast(typeByte);
+        _CASE(178);
+        byteOut.next <== clkCnt.shiftRight(16).cast(typeByte);
+        _CASE(179);
+        byteOut.next <== clkCnt.shiftRight(24).cast(typeByte);
+        _CASE(180);
+        byteOut.next <== clkCnt.shiftRight(32).cast(typeByte);
+        _CASE(181);
+        byteOut.next <== clkCnt.shiftRight(40).cast(typeByte);
+        _CASE(182);
+        byteOut.next <== clkCnt.shiftRight(48).cast(typeByte);
+        _CASE(183);
+        byteOut.next <== clkCnt.shiftRight(56).cast(typeByte);
+        _CASE(184); // finished signal
+        for (int SMID = 0; SMID < NUMBER_OF_SM; SMID++) {
+                IF (sMode[SMID].eq(Modes.SYSTEM_EXIT)) {
+                        byteOut.next <== 1;
+                }
+        }
+        // Byte 185ff. show the max reached stage of each SM
+        for (int SMID = 0; SMID < NUMBER_OF_SM; SMID++) {
+                _CASE(185+SMID);
+                byteOut.next <== maxStage[SMID].cast(typeByte);
+        }
+        _OTHERWISE();
+        _END_SWITCH();
+}
+
+// Read ctrl.
+sReadDataReady.next <== ~input.empty;
+
+DFEsmValue tmp_n0 = constant.value(typeByte, 0);
+DFEsmValue tmp_n1 = constant.value(typeByte, 0);
+	/*
+* If we get data from the input, then we consume input
+* else we do the computation */
+IF (sReadDataReady.eq(true)) {
+// Wire input with vars.
+_SWITCH(sCounterIn);
+for (int i = 0; i <= 175; ++i) {
+    _CASE(i);
+    ksD[i].next <== input;
+}
+_OTHERWISE();
+_END_SWITCH();
+
+// Nope. Go on.
+sCounterIn.next <== sCounterIn + 1;
+} ELSE {
+for (int SMID=0; SMID< NUMBER_OF_SM; SMID++){
+SWITCH (sMode[SMID]) {
+// Init, get input data.
+CASE (Modes.INIT) {
+// Check if reading input is done.
+IF(sCounterIn.eq(176)) {
+// Done. Start computation.
+debug.simPrintf(":: %d :: -- Reading Input ... Done. \n", smID);
+
+printKeySchedule(ksD);
+
+debug.simPrintf("-- Start Computation. g0 = %d, interval: [%d-%d] \n", sNextGuessIndex[SMID], sGuessIndexStart, sGuessIndexEnd);
+
+sMode[SMID].next <== Modes.GUESS_STAGE_BYTE;
+
+ksC[SMID][path[0][0]].next <== romBetterGuess[SMID].dataOut;
+sNextGuessIndex[SMID].next <== 1;
+romBetterGuess[SMID].address <== 1;
+} ELSE {
+sNextGuessIndex[SMID].next <== this.sGuessIndexStart;
+romBetterGuess[SMID].address <== this.sGuessIndexStart;
+	}
+if (SMID != 0)
+	debug.simPrintf("I'm %d, INIT should never happen\n",SMID);
+	}
+	CASE (Modes.GUESS_STAGE_BYTE) {
+		SWITCH (sStage[SMID]) {
+CASE (0) {
+t = 0;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+// Compute errors in each direction in parallel.
+debug.simPrintf("Current Stage: 0 Current Index: %d, current value %d, next value (dataOut): %d\n", sNextGuessIndex[SMID]-1, ksC[SMID][path[0][0]], romBetterGuess[SMID].dataOut);
+tmp_n0 = isCompatible_evt_stage0(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_stage0(0, SMID).cast(typeError);
+
+IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+	n1[SMID].next <== tmp_n1;
+
+	// Yes Compatible, PUSH STATE
+	sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 1)
+	romBetterGuess[SMID].address <== 256;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+} ELSE {
+	// Not compatible, all bytes tested?
+	IF(sNextGuessIndex[SMID].eq(sGuessIndexEnd+1)) {
+		//  - YES: POP last valid state.
+		sMode[SMID].next <== Modes.STATE_POP;
+	} ELSE {
+		//  - NO: test next byte.
+		sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+		ksC[SMID][path[t][0]].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== sNextGuessIndex[SMID] + 1;
+}
+
+		// TODO: check here. reset values.
+		sCurrentN0[SMID].next <== 0;
+		sCurrentN1[SMID].next <== 0;
+
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+ }
+ }
+		//stage 1
+		CASE (1) {
+			t = 1;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+		// Get unSbox value. Complex computation.
+						_SWITCH(ksC[SMID][50].xor(ksC[SMID][34]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox1_1 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C47 = tUnSbox1_1;
+		ksC[SMID][47].next <== C47;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage1(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage1(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 2)
+	romBetterGuess[SMID].address <== 256*2;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][50].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*1+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+		}
+		//stage 2
+		CASE (2) {
+			t = 2;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+		// Get unSbox value. Complex computation.
+						_SWITCH(ksC[SMID][66].xor(ksC[SMID][50]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox2_1 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C63 = tUnSbox2_1;
+		ksC[SMID][63].next <== C63;
+DFEsmValue C59 = C63.xor(ksC[SMID][47]);
+		ksC[SMID][59].next <== C59;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage2(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage2(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 3)
+	romBetterGuess[SMID].address <== 256*3;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][66].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*2+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+		}
+		//stage 3
+		CASE (3) {
+			t = 3;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+		// Get unSbox value. Complex computation.
+						_SWITCH(ksC[SMID][34].xor(ksC[SMID][18]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox3_1 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C31 = tUnSbox3_1;
+		ksC[SMID][31].next <== C31;
+DFEsmValue C43 = ksC[SMID][47].xor(C31);
+		ksC[SMID][43].next <== C43;
+DFEsmValue C55 = ksC[SMID][59].xor(C43);
+		ksC[SMID][55].next <== C55;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage3(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage3(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 4)
+	romBetterGuess[SMID].address <== 256*4;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][18].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*3+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+		}
+		//stage 4
+		CASE (4) {
+			t = 4;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+		// Get unSbox value. Complex computation.
+						_SWITCH(ksC[SMID][82].xor(ksC[SMID][66]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox4_1 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C79 = tUnSbox4_1;
+		ksC[SMID][79].next <== C79;
+DFEsmValue C75 = C79.xor(ksC[SMID][63]);
+		ksC[SMID][75].next <== C75;
+DFEsmValue C71 = C75.xor(ksC[SMID][59]);
+		ksC[SMID][71].next <== C71;
+DFEsmValue C67 = C71.xor(ksC[SMID][55]);
+		ksC[SMID][67].next <== C67;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage4(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage4(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 5)
+	romBetterGuess[SMID].address <== 256*5;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][82].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*4+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+		}
+		//stage 5
+		CASE (5) {
+			t = 5;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+		// Get unSbox value. Complex computation.
+						_SWITCH(ksC[SMID][98].xor(ksC[SMID][82]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox5_1 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C95 = tUnSbox5_1;
+		ksC[SMID][95].next <== C95;
+DFEsmValue C91 = C95.xor(ksC[SMID][79]);
+		ksC[SMID][91].next <== C91;
+DFEsmValue C87 = C91.xor(ksC[SMID][75]);
+		ksC[SMID][87].next <== C87;
+DFEsmValue C83 = C87.xor(ksC[SMID][71]);
+		ksC[SMID][83].next <== C83;
+		// Get unSbox value. Complex computation.
+						_SWITCH(C83.xor(ksC[SMID][67]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox5_5 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C76 = tUnSbox5_5;
+		ksC[SMID][76].next <== C76;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage5(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage5(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 6)
+	romBetterGuess[SMID].address <== 256*6;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][98].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*5+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+		}
+		//stage 6
+		CASE (6) {
+			t = 6;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+		// Get unSbox value. Complex computation.
+						_SWITCH(ksC[SMID][114].xor(ksC[SMID][98]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox6_1 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C111 = tUnSbox6_1;
+		ksC[SMID][111].next <== C111;
+DFEsmValue C107 = C111.xor(ksC[SMID][95]);
+		ksC[SMID][107].next <== C107;
+DFEsmValue C103 = C107.xor(ksC[SMID][91]);
+		ksC[SMID][103].next <== C103;
+DFEsmValue C99 = C103.xor(ksC[SMID][87]);
+		ksC[SMID][99].next <== C99;
+		// Get unSbox value. Complex computation.
+						_SWITCH(C99.xor(ksC[SMID][83]));
+						for (int i = 0; i <= 255; ++i) {
+							_CASE(i);
+							tUnSbox6_5 <== unsbox[i];
+						}
+						_OTHERWISE(); _END_SWITCH();
+			DFEsmValue C92 = tUnSbox6_5;
+		ksC[SMID][92].next <== C92;
+DFEsmValue C88 = C92.xor(ksC[SMID][76]);
+		ksC[SMID][88].next <== C88;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage6(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage6(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 7)
+	romBetterGuess[SMID].address <== 256*7;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][114].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*6+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+		}
+		//stage 7a
+		CASE (7) {
+			t = 7;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+			romUnSbox[SMID].address <== ksC[SMID][130].xor(ksC[SMID][114]);
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C127 = romUnSbox[SMID].dataOut;
+		ksC[SMID][127].next <== C127;
+DFEsmValue C123 = C127.xor(ksC[SMID][111]);
+		ksC[SMID][123].next <== C123;
+DFEsmValue C119 = C123.xor(ksC[SMID][107]);
+		ksC[SMID][119].next <== C119;
+DFEsmValue C115 = C119.xor(ksC[SMID][103]);
+		ksC[SMID][115].next <== C115;
+			romUnSbox[SMID].address <== C115.xor(ksC[SMID][99]);
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+			DFEsmValue C108 = romUnSbox[SMID].dataOut;
+		ksC[SMID][108].next <== C108;
+DFEsmValue C104 = C108.xor(ksC[SMID][92]);
+		ksC[SMID][104].next <== C104;
+DFEsmValue C100 = C104.xor(ksC[SMID][88]);
+		ksC[SMID][100].next <== C100;
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage7a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage7a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][130].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*7+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+		}
+		//stage 7b
+		CASE (8) {
+			t = 7;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage7b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage7b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 8)
+	romBetterGuess[SMID].address <== 256*8;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][130].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*7+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 8a
+		CASE (9) {
+			t = 8;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+			romUnSbox[SMID].address <== ksC[SMID][146].xor(ksC[SMID][130]);
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C143 = romUnSbox[SMID].dataOut;
+		ksC[SMID][143].next <== C143;
+DFEsmValue C139 = C143.xor(ksC[SMID][127]);
+		ksC[SMID][139].next <== C139;
+DFEsmValue C135 = C139.xor(ksC[SMID][123]);
+		ksC[SMID][135].next <== C135;
+DFEsmValue C131 = C135.xor(ksC[SMID][119]);
+		ksC[SMID][131].next <== C131;
+			romUnSbox[SMID].address <== C131.xor(ksC[SMID][115]);
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+			DFEsmValue C124 = romUnSbox[SMID].dataOut;
+		ksC[SMID][124].next <== C124;
+DFEsmValue C120 = C124.xor(ksC[SMID][108]);
+		ksC[SMID][120].next <== C120;
+DFEsmValue C116 = C120.xor(ksC[SMID][104]);
+		ksC[SMID][116].next <== C116;
+DFEsmValue C112 = C116.xor(ksC[SMID][100]);
+		ksC[SMID][112].next <== C112;
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage8a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage8a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][146].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*8+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+		}
+		//stage 8b
+		CASE (10) {
+			t = 8;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage8b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage8b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 9)
+	romBetterGuess[SMID].address <== 256*9;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][146].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*8+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 9a
+		CASE (11) {
+			t = 9;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+			romUnSbox[SMID].address <== ksC[SMID][162].xor(ksC[SMID][146]);
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C159 = romUnSbox[SMID].dataOut;
+		ksC[SMID][159].next <== C159;
+DFEsmValue C155 = C159.xor(ksC[SMID][143]);
+		ksC[SMID][155].next <== C155;
+DFEsmValue C151 = C155.xor(ksC[SMID][139]);
+		ksC[SMID][151].next <== C151;
+DFEsmValue C147 = C151.xor(ksC[SMID][135]);
+		ksC[SMID][147].next <== C147;
+			romUnSbox[SMID].address <== C147.xor(ksC[SMID][131]);
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+			DFEsmValue C140 = romUnSbox[SMID].dataOut;
+		ksC[SMID][140].next <== C140;
+DFEsmValue C136 = C140.xor(ksC[SMID][124]);
+		ksC[SMID][136].next <== C136;
+DFEsmValue C132 = C136.xor(ksC[SMID][120]);
+		ksC[SMID][132].next <== C132;
+DFEsmValue C128 = C132.xor(ksC[SMID][116]);
+		ksC[SMID][128].next <== C128;
+			romUnSbox[SMID].address <== C128.xor(ksC[SMID][112]).xor(rcon[8]);
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 3. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][3].eq(false))) {
+			DFEsmValue C125 = romUnSbox[SMID].dataOut;
+		ksC[SMID][125].next <== C125;
+							sFlagMem[SMID][3].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage9a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage9a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][162].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*9+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+}
+		}
+		//stage 9b
+		CASE (12) {
+			t = 9;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage9b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage9b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 10)
+	romBetterGuess[SMID].address <== 256*10;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][162].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*9+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 10a
+		CASE (13) {
+			t = 10;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+			romUnSbox[SMID].address <== ksC[SMID][18].xor(ksC[SMID][2]);
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C15 = romUnSbox[SMID].dataOut;
+		ksC[SMID][15].next <== C15;
+DFEsmValue C27 = ksC[SMID][31].xor(C15);
+		ksC[SMID][27].next <== C27;
+DFEsmValue C39 = ksC[SMID][43].xor(C27);
+		ksC[SMID][39].next <== C39;
+DFEsmValue C51 = ksC[SMID][55].xor(C39);
+		ksC[SMID][51].next <== C51;
+			romUnSbox[SMID].address <== ksC[SMID][67].xor(C51);
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+			DFEsmValue C60 = romUnSbox[SMID].dataOut;
+		ksC[SMID][60].next <== C60;
+DFEsmValue C72 = ksC[SMID][76].xor(C60);
+		ksC[SMID][72].next <== C72;
+DFEsmValue C84 = ksC[SMID][88].xor(C72);
+		ksC[SMID][84].next <== C84;
+DFEsmValue C96 = ksC[SMID][100].xor(C84);
+		ksC[SMID][96].next <== C96;
+			romUnSbox[SMID].address <== ksC[SMID][112].xor(C96).xor(rcon[7]);
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 3. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][3].eq(false))) {
+			DFEsmValue C109 = romUnSbox[SMID].dataOut;
+		ksC[SMID][109].next <== C109;
+DFEsmValue C121 = ksC[SMID][125].xor(C109);
+		ksC[SMID][121].next <== C121;
+							sFlagMem[SMID][3].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage10a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage10a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][2].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*10+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+}
+		}
+		//stage 10b
+		CASE (14) {
+			t = 10;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage10b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage10b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 11)
+	romBetterGuess[SMID].address <== 256*11;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][2].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*10+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 11a
+		CASE (15) {
+			t = 11;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+DFEsmValue C171 = ksC[SMID][175].xor(ksC[SMID][159]);
+		ksC[SMID][171].next <== C171;
+DFEsmValue C167 = C171.xor(ksC[SMID][155]);
+		ksC[SMID][167].next <== C167;
+DFEsmValue C163 = C167.xor(ksC[SMID][151]);
+		ksC[SMID][163].next <== C163;
+			romUnSbox[SMID].address <== C163.xor(ksC[SMID][147]);
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C156 = romUnSbox[SMID].dataOut;
+		ksC[SMID][156].next <== C156;
+DFEsmValue C152 = C156.xor(ksC[SMID][140]);
+		ksC[SMID][152].next <== C152;
+DFEsmValue C148 = C152.xor(ksC[SMID][136]);
+		ksC[SMID][148].next <== C148;
+DFEsmValue C144 = C148.xor(ksC[SMID][132]);
+		ksC[SMID][144].next <== C144;
+			romUnSbox[SMID].address <== C144.xor(ksC[SMID][128]).xor(rcon[9]);
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+			DFEsmValue C141 = romUnSbox[SMID].dataOut;
+		ksC[SMID][141].next <== C141;
+DFEsmValue C137 = C141.xor(ksC[SMID][125]);
+		ksC[SMID][137].next <== C137;
+DFEsmValue C133 = C137.xor(ksC[SMID][121]);
+		ksC[SMID][133].next <== C133;
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage11a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage11a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][175].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*11+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+		}
+		//stage 11b
+		CASE (16) {
+			t = 11;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage11b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage11b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 12)
+	romBetterGuess[SMID].address <== 256*12;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][175].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*11+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 12a
+		CASE (17) {
+			t = 12;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+DFEsmValue C117 = ksC[SMID][129].xor(ksC[SMID][133]);
+		ksC[SMID][117].next <== C117;
+DFEsmValue C105 = C117.xor(ksC[SMID][121]);
+		ksC[SMID][105].next <== C105;
+DFEsmValue C93 = C105.xor(ksC[SMID][109]);
+		ksC[SMID][93].next <== C93;
+			romSbox[SMID].address <== C93;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+DFEsmValue C80 = ksC[SMID][96].xor(romSbox[SMID].dataOut).xor(rcon[6]);
+		ksC[SMID][80].next <== C80;
+DFEsmValue C68 = C80.xor(ksC[SMID][84]);
+		ksC[SMID][68].next <== C68;
+DFEsmValue C56 = C68.xor(ksC[SMID][72]);
+		ksC[SMID][56].next <== C56;
+DFEsmValue C44 = C56.xor(ksC[SMID][60]);
+		ksC[SMID][44].next <== C44;
+			romSbox[SMID].address <== C44;
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+			DFEsmValue C35 = ksC[SMID][51].xor(romSbox[SMID].dataOut);
+		ksC[SMID][35].next <== C35;
+DFEsmValue C23 = C35.xor(ksC[SMID][39]);
+		ksC[SMID][23].next <== C23;
+DFEsmValue C11 = C23.xor(ksC[SMID][27]);
+		ksC[SMID][11].next <== C11;
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage12a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage12a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][129].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*12+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+		}
+		//stage 12b
+		CASE (18) {
+			t = 12;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage12b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage12b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 13)
+	romBetterGuess[SMID].address <== 256*13;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][129].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*12+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 13a
+		CASE (19) {
+			t = 13;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+			romSbox[SMID].address <== ksC[SMID][126];
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C113 = ksC[SMID][129].xor(romSbox[SMID].dataOut);
+		ksC[SMID][113].next <== C113;
+DFEsmValue C101 = C113.xor(ksC[SMID][117]);
+		ksC[SMID][101].next <== C101;
+DFEsmValue C89 = C101.xor(ksC[SMID][105]);
+		ksC[SMID][89].next <== C89;
+DFEsmValue C77 = C89.xor(ksC[SMID][93]);
+		ksC[SMID][77].next <== C77;
+			romSbox[SMID].address <== C77;
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+DFEsmValue C64 = ksC[SMID][80].xor(romSbox[SMID].dataOut).xor(rcon[5]);
+		ksC[SMID][64].next <== C64;
+DFEsmValue C52 = C64.xor(ksC[SMID][68]);
+		ksC[SMID][52].next <== C52;
+DFEsmValue C40 = C52.xor(ksC[SMID][56]);
+		ksC[SMID][40].next <== C40;
+DFEsmValue C28 = C40.xor(ksC[SMID][44]);
+		ksC[SMID][28].next <== C28;
+			romSbox[SMID].address <== C28;
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 3. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][3].eq(false))) {
+			DFEsmValue C19 = ksC[SMID][35].xor(romSbox[SMID].dataOut);
+		ksC[SMID][19].next <== C19;
+DFEsmValue C7 = C19.xor(ksC[SMID][23]);
+		ksC[SMID][7].next <== C7;
+							sFlagMem[SMID][3].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage13a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage13a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][126].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*13+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+}
+		}
+		//stage 13b
+		CASE (20) {
+			t = 13;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage13b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage13b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 14)
+	romBetterGuess[SMID].address <== 256*14;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][126].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*13+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 14a
+		CASE (21) {
+			t = 14;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+DFEsmValue C110 = ksC[SMID][122].xor(ksC[SMID][126]);
+		ksC[SMID][110].next <== C110;
+			romSbox[SMID].address <== C110;
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C97 = ksC[SMID][113].xor(romSbox[SMID].dataOut);
+		ksC[SMID][97].next <== C97;
+DFEsmValue C85 = C97.xor(ksC[SMID][101]);
+		ksC[SMID][85].next <== C85;
+DFEsmValue C73 = C85.xor(ksC[SMID][89]);
+		ksC[SMID][73].next <== C73;
+DFEsmValue C61 = C73.xor(ksC[SMID][77]);
+		ksC[SMID][61].next <== C61;
+			romSbox[SMID].address <== C61;
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+DFEsmValue C48 = ksC[SMID][64].xor(romSbox[SMID].dataOut).xor(rcon[4]);
+		ksC[SMID][48].next <== C48;
+DFEsmValue C36 = C48.xor(ksC[SMID][52]);
+		ksC[SMID][36].next <== C36;
+DFEsmValue C24 = C36.xor(ksC[SMID][40]);
+		ksC[SMID][24].next <== C24;
+DFEsmValue C12 = C24.xor(ksC[SMID][28]);
+		ksC[SMID][12].next <== C12;
+			romSbox[SMID].address <== C12;
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 3. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][3].eq(false))) {
+			DFEsmValue C3 = ksC[SMID][19].xor(romSbox[SMID].dataOut);
+		ksC[SMID][3].next <== C3;
+							sFlagMem[SMID][3].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage14a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage14a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][122].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*14+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+}
+		}
+		//stage 14b
+		CASE (22) {
+			t = 14;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage14b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage14b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Yes, PUSH STATE
+		sMode[SMID].next <== Modes.STATE_PUSH;
+//Set ROM adress to 0 position of next stage (realstage 15)
+	romBetterGuess[SMID].address <== 256*15;
+	sValueBackupOnPush[SMID].next <== romBetterGuess[SMID].dataOut.cast(typeByte);
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][122].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*14+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+		//stage 15a
+		CASE (23) {
+			t = 15;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+							// Sub-Stage 0. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][0].eq(false))) {
+DFEsmValue C168 = ksC[SMID][172].xor(ksC[SMID][156]);
+		ksC[SMID][168].next <== C168;
+DFEsmValue C164 = C168.xor(ksC[SMID][152]);
+		ksC[SMID][164].next <== C164;
+DFEsmValue C160 = C164.xor(ksC[SMID][148]);
+		ksC[SMID][160].next <== C160;
+			romUnSbox[SMID].address <== C160.xor(ksC[SMID][144]).xor(rcon[10]);
+							sFlagMem[SMID][0].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 1. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][1].eq(false))) {
+			DFEsmValue C157 = romUnSbox[SMID].dataOut;
+		ksC[SMID][157].next <== C157;
+DFEsmValue C153 = C157.xor(ksC[SMID][141]);
+		ksC[SMID][153].next <== C153;
+DFEsmValue C149 = C153.xor(ksC[SMID][137]);
+		ksC[SMID][149].next <== C149;
+DFEsmValue C145 = C149.xor(ksC[SMID][133]);
+		ksC[SMID][145].next <== C145;
+			romUnSbox[SMID].address <== C145.xor(ksC[SMID][129]);
+							sFlagMem[SMID][1].next <== true;
+			}
+			ELSE {
+							// Sub-Stage 2. 
+								IF(sFlagRecover[SMID].eq(false).and(sFlagMem[SMID][2].eq(false))) {
+			DFEsmValue C142 = romUnSbox[SMID].dataOut;
+		ksC[SMID][142].next <== C142;
+DFEsmValue C138 = C142.xor(ksC[SMID][126]);
+		ksC[SMID][138].next <== C138;
+DFEsmValue C134 = C138.xor(ksC[SMID][122]);
+		ksC[SMID][134].next <== C134;
+							sFlagMem[SMID][2].next <== true;
+			}
+			ELSE {
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage15a(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage15a(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		// Go to next stage for Xb 
+		sStage[SMID].next <== sStage[SMID] + 1;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][172].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*15+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+	}
+}
+}
+}
+		}
+		//stage 15b
+		CASE (24) {
+			t = 15;
+romBetterGuess[SMID].address <== (256*t+ sNextGuessIndex[SMID]).cast(typeBetterGuessROMAddress);
+
+					// Compute errors in each direction in parallel.
+					tmp_n0 = isCompatible_evt_stage15b(1, SMID).cast(typeError);
+					tmp_n1 = isCompatible_evt_stage15b(0, SMID).cast(typeError);
+					// debug.simPrintf("-- %d/%d/%d %d/%d/%d -- \n", tmp_n0, sCurrentN0[SMID], expected_n0, tmp_n1, sCurrentN1[SMID], expected_n1);
+					// Check for compatibility.
+	IF(sFlagRecover[SMID].eq(false).and(((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1)))) {
+	n0[SMID].next <== tmp_n0;
+		n1[SMID].next <== tmp_n1;
+		debug.simPrintf("  --> %d  \n", sNextGuessIndex[SMID]);
+	//	printKeySchedule(ksC[SMID]);
+		debug.simPrintf(" --> Round 8 complete! \n");
+		// Done ... PUSH State, derive remaining bits of key Schedule and verify
+		sMode[SMID].next <== Modes.STATE_PUSH;
+	} ELSE {
+		// Not compatible, all bytes tested?
+		IF(sNextGuessIndex[SMID].eq(256)) {
+			//  - YES: POP STATE
+			sMode[SMID].next <== Modes.STATE_POP;
+		} ELSE {
+			//  - NO: test next byte
+			sNextGuessIndex[SMID].next <== sNextGuessIndex[SMID] + 1;
+			ksC[SMID][172].next <== romBetterGuess[SMID].dataOut;
+romBetterGuess[SMID].address <== (256*15+ sNextGuessIndex[SMID] + 1).cast(typeBetterGuessROMAddress);
+			// Reset memory flags.
+			sFlagMem[SMID][0].next <== false;
+			sFlagMem[SMID][1].next <== false;
+			sFlagMem[SMID][2].next <== false;
+			sFlagMem[SMID][3].next <== false;
+		}
+		// Set to normal mode.
+		sFlagRecover[SMID].next <== false;
+			sStage[SMID].next <== sStage[SMID] - 1;
+	}
+		}
+	}
+}
+CASE (Modes.STATE_PUSH) {
+debug.simPrintf("  --> Stage %d COMPATIBLE Index %d \n", sStage[SMID], sNextGuessIndex[SMID]-1);
+
+// printKeySchedule(ksC[SMID]);
+
+// Set next stage.
+sStage[SMID].next <== sStage[SMID]+1;
+IF (maxStage[SMID].eq(sStage[SMID]))
+maxStage[SMID].next <== sStage[SMID]+1;
+// Change main state.
+sMode[SMID].next <== Modes.GUESS_STAGE_BYTE;
+SWITCH (sStage[SMID]) {
+// reduced representation: In first Case of a splitted stage, no action is performed. So these cases are not mentioned
+// If the old Otherwise (with rom.address setter) is restored, they might need to be used again
+ CASE(0) { state_push(0, SMID); }
+ CASE(1) { state_push(1, SMID); }
+ CASE(2) { state_push(2, SMID); }
+ CASE(3) { state_push(3, SMID); }
+ CASE(4) { state_push(4, SMID); }
+ CASE(5) { state_push(5, SMID); }
+ CASE(6) { state_push(6, SMID); }
+ CASE(8) { state_push(7, SMID); }
+ CASE(10) { state_push(8, SMID); }
+ CASE(12) { state_push(9, SMID); }
+ CASE(14) { state_push(10, SMID); }
+ CASE(16) { state_push(11, SMID); }
+ CASE(18) { state_push(12, SMID); }
+ CASE(20) { state_push(13, SMID); }
+ CASE(22) { state_push(14, SMID); }
+ CASE(24) { state_push(15, SMID); sStage[SMID].next <== 0; sMode[SMID].next <== Modes.COMPLETE_FROM8;}
+	OTHERWISE {}
+}
+// Reset guessing index.
+sNextGuessIndex[SMID].next <== 1;
+
+// Reset helper.
+sFlagMem[SMID][0].next <== false;
+sFlagMem[SMID][1].next <== false;
+sFlagMem[SMID][2].next <== false;
+sFlagMem[SMID][3].next <== false;
+
+// Update current values.
+sCurrentN0[SMID].next <== sCurrentN0[SMID]+n0[SMID];
+sCurrentN1[SMID].next <== sCurrentN1[SMID]+n1[SMID];
+
+if (NUMBER_OF_SM >1 ) 
+ topOfStack[SMID].next <== topOfStack[SMID]+1;
+}
+CASE (Modes.STATE_POP) {
+	if (NUMBER_OF_SM==1){
+		doPOP(SMID);
+	}else {
+		//if own stack is empty, try to steal
+		IF (topOfStack [SMID] === bottomOfStack[SMID]){
+			IF (sMode[0] !== Modes.INIT){
+				//Signal: IdleNoResult
+				IF (idleNoResult[SMID] === false)
+				debug.simPrintf("I'm %d, have an empty stack and idleNoResult",SMID);
+				idleNoResult[SMID].next <== true;
+
+				//check: If SMID=0 and all SMs are IdleNoResult, go to Modes.RESULT_NO
+				if (SMID == 0){
+					DFEsmValue allIdle = idleNoResult[1];
+					//the for loop is needed for 3+ SMs. For 2 SMS, no additional hardware is generated.
+					for (int i=2; i <  NUMBER_OF_SM; i++)
+					allIdle &= idleNoResult[i];
+					IF (allIdle === true){
+						sMode[SMID].next <== Modes.RESULT_NO;
+					}
+				}
+
+				int target = (((SMID-1 % NUMBER_OF_SM) + NUMBER_OF_SM) % NUMBER_OF_SM);//1-SMID
+				DFEsmValue targetTOS=topOfStack[target];
+				DFEsmValue targetBOS=bottomOfStack[target];
+				debug.simPrintf("I'm %d and  want to steal from %d. targetTOS: %d targetBOS: %d\n",SMID, target,targetTOS,targetBOS);
+				IF (targetTOS-targetBOS > 1| (targetTOS-targetBOS === 1 & (sMode[target] !== Modes.STATE_POP)))
+				doSteal(target,SMID);
+			}
+			//else high-priority access for own stack!
+		}ELSE{
+			if( SMID == 1)
+			debug.simPrintf("I'm %d, and I pop myself\n",SMID);
+			//Do access like with a single SM
+			doPOP(SMID);
+			topOfStack[SMID].next <== topOfStack[SMID]-1;
+		}
+	}
+}CASE (Modes.COMPLETE_FROM8) {
+ sStage[SMID].next <== sStage[SMID]+1;
+ SWITCH (sStage[SMID]) {
+CASE(0){
+DFEsmValue C118 = ksC[SMID][130].xor(ksC[SMID][134]);
+		ksC[SMID][118].next <== C118;
+DFEsmValue C150 = ksC[SMID][146].xor(ksC[SMID][134]);
+		ksC[SMID][150].next <== C150;
+DFEsmValue C102 = ksC[SMID][114].xor(C118);
+		ksC[SMID][102].next <== C102;
+DFEsmValue C106 = C118.xor(ksC[SMID][122]);
+		ksC[SMID][106].next <== C106;
+DFEsmValue C154 = C150.xor(ksC[SMID][138]);
+		ksC[SMID][154].next <== C154;
+DFEsmValue C166 = ksC[SMID][162].xor(C150);
+		ksC[SMID][166].next <== C166;
+DFEsmValue C86 = ksC[SMID][98].xor(C102);
+		ksC[SMID][86].next <== C86;
+DFEsmValue C90 = C102.xor(C106);
+		ksC[SMID][90].next <== C90;
+DFEsmValue C94 = C106.xor(ksC[SMID][110]);
+		ksC[SMID][94].next <== C94;
+DFEsmValue C158 = C154.xor(ksC[SMID][142]);
+		ksC[SMID][158].next <== C158;
+DFEsmValue C170 = C166.xor(C154);
+		ksC[SMID][170].next <== C170;
+			romSbox[SMID].address <== C94;
+}
+CASE(1){
+			DFEsmValue C81 = ksC[SMID][97].xor(romSbox[SMID].dataOut);
+		ksC[SMID][81].next <== C81;
+DFEsmValue C69 = C81.xor(ksC[SMID][85]);
+		ksC[SMID][69].next <== C69;
+DFEsmValue C70 = ksC[SMID][82].xor(ksC[SMID][86]);
+		ksC[SMID][70].next <== C70;
+DFEsmValue C74 = ksC[SMID][86].xor(ksC[SMID][90]);
+		ksC[SMID][74].next <== C74;
+DFEsmValue C78 = ksC[SMID][90].xor(ksC[SMID][94]);
+		ksC[SMID][78].next <== C78;
+DFEsmValue C174 = ksC[SMID][170].xor(ksC[SMID][158]);
+		ksC[SMID][174].next <== C174;
+DFEsmValue C54 = ksC[SMID][66].xor(C70);
+		ksC[SMID][54].next <== C54;
+DFEsmValue C57 = C69.xor(ksC[SMID][73]);
+		ksC[SMID][57].next <== C57;
+DFEsmValue C58 = C70.xor(C74);
+		ksC[SMID][58].next <== C58;
+DFEsmValue C62 = C74.xor(C78);
+		ksC[SMID][62].next <== C62;
+DFEsmValue C38 = ksC[SMID][50].xor(C54);
+		ksC[SMID][38].next <== C38;
+DFEsmValue C42 = C54.xor(C58);
+		ksC[SMID][42].next <== C42;
+DFEsmValue C45 = C57.xor(ksC[SMID][61]);
+		ksC[SMID][45].next <== C45;
+DFEsmValue C46 = C58.xor(C62);
+		ksC[SMID][46].next <== C46;
+			romSbox[SMID].address <== C45;
+}
+CASE(2){
+DFEsmValue C32 = ksC[SMID][48].xor(romSbox[SMID].dataOut).xor(rcon[3]);
+		ksC[SMID][32].next <== C32;
+DFEsmValue C20 = C32.xor(ksC[SMID][36]);
+		ksC[SMID][20].next <== C20;
+DFEsmValue C22 = ksC[SMID][34].xor(ksC[SMID][38]);
+		ksC[SMID][22].next <== C22;
+DFEsmValue C26 = ksC[SMID][38].xor(ksC[SMID][42]);
+		ksC[SMID][26].next <== C26;
+DFEsmValue C30 = ksC[SMID][42].xor(ksC[SMID][46]);
+		ksC[SMID][30].next <== C30;
+DFEsmValue C6 = ksC[SMID][18].xor(C22);
+		ksC[SMID][6].next <== C6;
+DFEsmValue C8 = C20.xor(ksC[SMID][24]);
+		ksC[SMID][8].next <== C8;
+DFEsmValue C10 = C22.xor(C26);
+		ksC[SMID][10].next <== C10;
+DFEsmValue C14 = C26.xor(C30);
+		ksC[SMID][14].next <== C14;
+			romSbox[SMID].address <== ksC[SMID][78];
+}
+CASE(3){
+			DFEsmValue C65 = ksC[SMID][81].xor(romSbox[SMID].dataOut);
+		ksC[SMID][65].next <== C65;
+DFEsmValue C53 = C65.xor(ksC[SMID][69]);
+		ksC[SMID][53].next <== C53;
+DFEsmValue C41 = C53.xor(ksC[SMID][57]);
+		ksC[SMID][41].next <== C41;
+DFEsmValue C29 = C41.xor(ksC[SMID][45]);
+		ksC[SMID][29].next <== C29;
+			romSbox[SMID].address <== C29;
+}
+CASE(4){
+DFEsmValue C16 = ksC[SMID][32].xor(romSbox[SMID].dataOut).xor(rcon[2]);
+		ksC[SMID][16].next <== C16;
+DFEsmValue C4 = C16.xor(ksC[SMID][20]);
+		ksC[SMID][4].next <== C4;
+			romSbox[SMID].address <== ksC[SMID][62];
+}
+CASE(5){
+			DFEsmValue C49 = ksC[SMID][65].xor(romSbox[SMID].dataOut);
+		ksC[SMID][49].next <== C49;
+DFEsmValue C37 = C49.xor(ksC[SMID][53]);
+		ksC[SMID][37].next <== C37;
+DFEsmValue C25 = C37.xor(ksC[SMID][41]);
+		ksC[SMID][25].next <== C25;
+DFEsmValue C13 = C25.xor(ksC[SMID][29]);
+		ksC[SMID][13].next <== C13;
+			romSbox[SMID].address <== C13;
+}
+CASE(6){
+DFEsmValue C0 = ksC[SMID][16].xor(romSbox[SMID].dataOut).xor(rcon[1]);
+		ksC[SMID][0].next <== C0;
+			romSbox[SMID].address <== ksC[SMID][46];
+}
+CASE(7){
+			DFEsmValue C33 = ksC[SMID][49].xor(romSbox[SMID].dataOut);
+		ksC[SMID][33].next <== C33;
+DFEsmValue C21 = C33.xor(ksC[SMID][37]);
+		ksC[SMID][21].next <== C21;
+DFEsmValue C9 = C21.xor(ksC[SMID][25]);
+		ksC[SMID][9].next <== C9;
+			romSbox[SMID].address <== ksC[SMID][30];
+}
+CASE(8){
+			DFEsmValue C17 = ksC[SMID][33].xor(romSbox[SMID].dataOut);
+		ksC[SMID][17].next <== C17;
+DFEsmValue C5 = C17.xor(ksC[SMID][21]);
+		ksC[SMID][5].next <== C5;
+			romSbox[SMID].address <== ksC[SMID][14];
+}
+CASE(9){
+			DFEsmValue C1 = ksC[SMID][17].xor(romSbox[SMID].dataOut);
+		ksC[SMID][1].next <== C1;
+			romSbox[SMID].address <== ksC[SMID][158];
+}
+CASE(10){
+			DFEsmValue C161 = ksC[SMID][145].xor(romSbox[SMID].dataOut);
+		ksC[SMID][161].next <== C161;
+DFEsmValue C165 = C161.xor(ksC[SMID][149]);
+		ksC[SMID][165].next <== C165;
+DFEsmValue C169 = C165.xor(ksC[SMID][153]);
+		ksC[SMID][169].next <== C169;
+DFEsmValue C173 = C169.xor(ksC[SMID][157]);
+		ksC[SMID][173].next <== C173;
+sMode[SMID].next <== Modes.FINAL_CHECK;
+sStage[SMID].next <== 0;
+}
+OTHERWISE {}
+}
+}
+
+CASE (Modes.FINAL_CHECK) {
+SWITCH (sStage[SMID]) {
+CASE (0){
+tmp_n0 = isCompatible_evt_final_1(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_final_1(0, SMID).cast(typeError);
+IF (((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1))) {
+  sStage[SMID].next <== sStage[SMID] + 1;
+  sCurrentN0[SMID].next <== sCurrentN0[SMID]+tmp_n0;
+  sCurrentN1[SMID].next <== sCurrentN1[SMID]+tmp_n1;
+}
+ELSE{
+  sMode[SMID].next <== Modes.STATE_POP;
+  sStage[SMID].next <== 25;
+}
+}
+CASE (1){
+tmp_n0 = isCompatible_evt_final_2(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_final_2(0, SMID).cast(typeError);
+IF (((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1))) {
+  sStage[SMID].next <== sStage[SMID] + 1;
+  sCurrentN0[SMID].next <== sCurrentN0[SMID]+tmp_n0;
+  sCurrentN1[SMID].next <== sCurrentN1[SMID]+tmp_n1;
+}
+ELSE{
+  sMode[SMID].next <== Modes.STATE_POP;
+  sStage[SMID].next <== 25;
+}
+}
+CASE (2){
+tmp_n0 = isCompatible_evt_final_3(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_final_3(0, SMID).cast(typeError);
+IF (((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1))) {
+  sStage[SMID].next <== sStage[SMID] + 1;
+  sCurrentN0[SMID].next <== sCurrentN0[SMID]+tmp_n0;
+  sCurrentN1[SMID].next <== sCurrentN1[SMID]+tmp_n1;
+}
+ELSE{
+  sMode[SMID].next <== Modes.STATE_POP;
+  sStage[SMID].next <== 25;
+}
+}
+CASE (3){
+tmp_n0 = isCompatible_evt_final_4(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_final_4(0, SMID).cast(typeError);
+IF (((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1))) {
+  sStage[SMID].next <== sStage[SMID] + 1;
+  sCurrentN0[SMID].next <== sCurrentN0[SMID]+tmp_n0;
+  sCurrentN1[SMID].next <== sCurrentN1[SMID]+tmp_n1;
+}
+ELSE{
+  sMode[SMID].next <== Modes.STATE_POP;
+  sStage[SMID].next <== 25;
+}
+}
+CASE (4){
+tmp_n0 = isCompatible_evt_final_5(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_final_5(0, SMID).cast(typeError);
+IF (((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1))) {
+  sStage[SMID].next <== sStage[SMID] + 1;
+  sCurrentN0[SMID].next <== sCurrentN0[SMID]+tmp_n0;
+  sCurrentN1[SMID].next <== sCurrentN1[SMID]+tmp_n1;
+}
+ELSE{
+  sMode[SMID].next <== Modes.STATE_POP;
+  sStage[SMID].next <== 25;
+}
+}
+CASE (5){
+tmp_n0 = isCompatible_evt_final_6(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_final_6(0, SMID).cast(typeError);
+IF (((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1))) {
+  sStage[SMID].next <== sStage[SMID] + 1;
+  sCurrentN0[SMID].next <== sCurrentN0[SMID]+tmp_n0;
+  sCurrentN1[SMID].next <== sCurrentN1[SMID]+tmp_n1;
+}
+ELSE{
+  sMode[SMID].next <== Modes.STATE_POP;
+  sStage[SMID].next <== 25;
+}
+}
+CASE (6){
+tmp_n0 = isCompatible_evt_final_7(1, SMID).cast(typeError);
+tmp_n1 = isCompatible_evt_final_7(0, SMID).cast(typeError);
+IF (((sCurrentN0[SMID]+tmp_n0) <= expected_n0).and(((sCurrentN1[SMID]+tmp_n1) <= expected_n1))) {
+  sStage[SMID].next <== sStage[SMID] + 1;
+  sCurrentN0[SMID].next <== sCurrentN0[SMID]+tmp_n0;
+  sCurrentN1[SMID].next <== sCurrentN1[SMID]+tmp_n1;
+sMode[SMID].next <== Modes.RESULT_DONE;
+}
+ELSE{
+  sMode[SMID].next <== Modes.STATE_POP;
+  sStage[SMID].next <== 25;
+}
+}
+}
+}
+CASE (Modes.RESULT_NO) {
+debug.simPrintf("------- RESULT_NO \n");
+
+// Set key schedule to zero.
+for(int i=0; i<KEY_SIZE; i++) {
+	ksC[SMID][i].next <== constant.value(typeByte, 0);
+ }
+
+printKeySchedule(ksC[SMID]);
+
+sCounterIn.next <== 0;
+sMode[SMID].next <== Modes.SYSTEM_EXIT;
+	}
+	CASE (Modes.RESULT_DONE) {          
+		debug.simPrintf("------- RESULT_DONE by %d \n",SMID);
+
+		printKeySchedule(ksC[SMID]);
+
+		DFEsmValue allowedToWrite = sCounterIn.eq(176);//constant.value(typeBoolean, 0);
+		for (int i=0; i< SMID;i++)
+		allowedToWrite &= (sMode[i] !== Modes.RESULT_DONE);
+		IF(allowedToWrite){
+			sCounterIn.next <== 0;
+			sMode[SMID].next <== Modes.SYSTEM_EXIT;
+		}
+	}
+CASE (Modes.SYSTEM_EXIT) {
+// debug.simPrintf("ComputationStop here \n");
+
+}
+OTHERWISE {}
+}
+	} 
+}
+	}
+@Override
+protected void outputFunction() {
+input.read <== ~input.empty;
+output.valid <== outValid;
+output <== byteOut;
+}
+
+public DFEsmValue isCompatible_evt_X(int p, int v, int SMID) {
+// Compare every position, check if D_i and C_i are different
+// (according to v) at this position.
+DFEsmValue[] check = new DFEsmValue[8];
+
+for(int i = 0;i < 8; i ++){
+// Test if D_i and C_i are different at this bit.
+check[i] = (((ksC[SMID][p] >> i) & 1) ^ ((ksD[p] >> i) & 1)).eq(1).and(((ksD[p] >> i) & 1).neq(v)).cast(typeBoolean);
+}
+
+// Sum diffs.
+DFEsmValue[] sum0 = new DFEsmValue[4];
+sum0[0] = check[0].cast(dfeUInt(2)).add(check[1].cast(dfeUInt(2)));
+sum0[1] = check[2].cast(dfeUInt(2)).add(check[3].cast(dfeUInt(2)));
+sum0[2] = check[4].cast(dfeUInt(2)).add(check[5].cast(dfeUInt(2)));
+sum0[3] = check[6].cast(dfeUInt(2)).add(check[7].cast(dfeUInt(2)));
+
+DFEsmValue[] sum1 = new DFEsmValue[2];
+sum1[0] = sum0[0].cast(dfeUInt(3)).add(sum0[1].cast(dfeUInt(3)));
+sum1[1] = sum0[2].cast(dfeUInt(3)).add(sum0[3].cast(dfeUInt(3)));
+
+return sum1[0].cast(dfeUInt(4)).add(sum1[1].cast(dfeUInt(4)));
+}
+
+private DFEsmValue isCompatible_evt_stage0(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(34, v, SMID);
+return s0;
+}
+
+private DFEsmValue isCompatible_evt_stage1(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(50, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(47, v, SMID);
+return s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+}
+
+private DFEsmValue isCompatible_evt_stage2(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(66, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(63, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(59, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+
+return suma0.cast(dfeUInt(6)).add(s2.cast(dfeUInt(6)));
+}
+
+private DFEsmValue isCompatible_evt_stage3(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(18, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(31, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(43, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(55, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+return suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+}
+
+private DFEsmValue isCompatible_evt_stage4(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(82, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(79, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(75, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(71, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(67, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage5(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(98, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(95, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(91, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(87, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(83, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(76, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(suma2.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage6(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(114, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(111, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(107, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(103, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(99, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(92, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(88, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(s6.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage7a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(130, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(127, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(123, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(119, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+return suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+}
+
+private DFEsmValue isCompatible_evt_stage7b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(115, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(108, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(104, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(100, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+return suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+}
+
+private DFEsmValue isCompatible_evt_stage8a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(146, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(143, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(139, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(135, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+return suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+}
+
+private DFEsmValue isCompatible_evt_stage8b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(131, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(124, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(120, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(116, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(112, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage9a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(162, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(159, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(155, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(151, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(147, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage9b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(140, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(136, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(132, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(128, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(125, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage10a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(2, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(15, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(27, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(39, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(51, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage10b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(60, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(72, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(84, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(96, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(109, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(121, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(suma2.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage11a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(175, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(171, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(167, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(163, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(156, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage11b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(152, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(148, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(144, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(141, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(137, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(133, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(suma2.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage12a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(129, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(117, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(105, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(93, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(80, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage12b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(68, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(56, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(44, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(35, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(23, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(11, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(suma2.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage13a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(126, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(113, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(101, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(89, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(77, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage13b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(64, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(52, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(40, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(28, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(19, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(7, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(suma2.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage14a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(122, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(110, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(97, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(85, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(73, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage14b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(61, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(48, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(36, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(24, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(12, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(3, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(suma2.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage15a(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(172, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(168, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(164, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(160, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(157, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(s4.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_stage15b(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(153, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(149, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(145, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(142, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(138, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(134, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(suma2.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_final_1(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(0, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(1, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(4, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(5, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(6, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(8, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(9, v, SMID);
+DFEsmValue s7 = isCompatible_evt_X(10, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+DFEsmValue suma3 = s6.cast(dfeUInt(5)).add(s7.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(suma3.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_final_2(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(13, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(14, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(16, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(17, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(20, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(21, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(22, v, SMID);
+DFEsmValue s7 = isCompatible_evt_X(25, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+DFEsmValue suma3 = s6.cast(dfeUInt(5)).add(s7.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(suma3.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_final_3(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(26, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(29, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(30, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(32, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(33, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(37, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(38, v, SMID);
+DFEsmValue s7 = isCompatible_evt_X(41, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+DFEsmValue suma3 = s6.cast(dfeUInt(5)).add(s7.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(suma3.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_final_4(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(42, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(45, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(46, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(49, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(53, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(54, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(57, v, SMID);
+DFEsmValue s7 = isCompatible_evt_X(58, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+DFEsmValue suma3 = s6.cast(dfeUInt(5)).add(s7.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(suma3.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_final_5(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(62, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(65, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(69, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(70, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(74, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(78, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(81, v, SMID);
+DFEsmValue s7 = isCompatible_evt_X(86, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+DFEsmValue suma3 = s6.cast(dfeUInt(5)).add(s7.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(suma3.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_final_6(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(90, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(94, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(102, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(106, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(118, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(150, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(154, v, SMID);
+DFEsmValue s7 = isCompatible_evt_X(158, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+DFEsmValue suma3 = s6.cast(dfeUInt(5)).add(s7.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(suma3.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+private DFEsmValue isCompatible_evt_final_7(int v, int SMID) {
+DFEsmValue s0 = isCompatible_evt_X(161, v, SMID);
+DFEsmValue s1 = isCompatible_evt_X(165, v, SMID);
+DFEsmValue s2 = isCompatible_evt_X(166, v, SMID);
+DFEsmValue s3 = isCompatible_evt_X(169, v, SMID);
+DFEsmValue s4 = isCompatible_evt_X(170, v, SMID);
+DFEsmValue s5 = isCompatible_evt_X(173, v, SMID);
+DFEsmValue s6 = isCompatible_evt_X(174, v, SMID);
+DFEsmValue suma0 = s0.cast(dfeUInt(5)).add(s1.cast(dfeUInt(5)));
+DFEsmValue suma1 = s2.cast(dfeUInt(5)).add(s3.cast(dfeUInt(5)));
+DFEsmValue suma2 = s4.cast(dfeUInt(5)).add(s5.cast(dfeUInt(5)));
+
+DFEsmValue sumb0 = suma0.cast(dfeUInt(6)).add(suma1.cast(dfeUInt(6)));
+DFEsmValue sumb1 = suma2.cast(dfeUInt(6)).add(s6.cast(dfeUInt(6)));
+
+return sumb0.cast(dfeUInt(7)).add(sumb1.cast(dfeUInt(7)));
+}
+
+/**
+ * Print the key schedule.
+ * @param b the bytes of key schedule.
+ */
+private void printKeySchedule(DFEsmStateValue[] b){
+	for(int i = 0; i < NUM_ROUNDS; i ++){
+	    for(int j = i*NUM_BYTES; j < i*NUM_BYTES + NUM_BYTES; j ++){
+			debug.simPrintf("%02x \t", b[j]);
+	  }
+	    debug.simPrintf("\n");
+	}
+	debug.simPrintf("\n");
+}
+
+private void doPOP(int SMID){
+// Stage exhausted.
+// Recover last valid state.
+debug.simPrintf("  <-- EXHAUSTED/BACKTRACKING - RECOVER LAST VALID STATE  \n");
+
+// Go back to last stage.
+sStage[SMID].next <== sStage[SMID]-1;
+
+SWITCH (sStage[SMID]) {
+// Stage 0.
+CASE (0) {
+// No result.
+sMode[SMID].next <== Modes.RESULT_NO;
+}
+ CASE(1) { state_pop(0, SMID); }
+ CASE(2) { state_pop(1, SMID); }
+ CASE(3) { state_pop(2, SMID); }
+ CASE(4) { state_pop(3, SMID); }
+ CASE(5) { state_pop(4, SMID); }
+ CASE(6) { state_pop(5, SMID); }
+ CASE(7) { state_pop(6, SMID); sStage[SMID].next <== 6; }
+ CASE(8) { state_pop(6, SMID); sStage[SMID].next <== 6; }
+ CASE(9) { state_pop(7, SMID); sStage[SMID].next <== 7; }
+ CASE(10) { state_pop(7, SMID); sStage[SMID].next <== 7; }
+ CASE(11) { state_pop(8, SMID); sStage[SMID].next <== 9; }
+ CASE(12) { state_pop(8, SMID); sStage[SMID].next <== 9; }
+ CASE(13) { state_pop(9, SMID); sStage[SMID].next <== 11; }
+ CASE(14) { state_pop(9, SMID); sStage[SMID].next <== 11; }
+ CASE(15) { state_pop(10, SMID); sStage[SMID].next <== 13; }
+ CASE(16) { state_pop(10, SMID); sStage[SMID].next <== 13; }
+ CASE(17) { state_pop(11, SMID); sStage[SMID].next <== 15; }
+ CASE(18) { state_pop(11, SMID); sStage[SMID].next <== 15; }
+ CASE(19) { state_pop(12, SMID); sStage[SMID].next <== 17; }
+ CASE(20) { state_pop(12, SMID); sStage[SMID].next <== 17; }
+ CASE(21) { state_pop(13, SMID); sStage[SMID].next <== 19; }
+ CASE(22) { state_pop(13, SMID); sStage[SMID].next <== 19; }
+ CASE(23) { state_pop(14, SMID); sStage[SMID].next <== 21; }
+ CASE(24) { state_pop(14, SMID); sStage[SMID].next <== 21; }
+ CASE(25) { state_pop(15, SMID); sStage[SMID].next <== 23; }
+OTHERWISE {}
+}
+// Set flag from recover.
+sFlagRecover[SMID].next <== true;
+
+//TODO: Check the if != 0 below
+IF (sStage[SMID] !== 0)
+sMode[SMID].next <== Modes.GUESS_STAGE_BYTE;
+}
+private void doSteal(int fromSMID, int toSMID){
+debug.simPrintf("  Will steal now from %d to %d   \n",fromSMID,toSMID);
+
+	SWITCH (bottomOfStack[fromSMID]) {
+CASE (0) { state_steal(0, fromSMID, toSMID); sStage[toSMID].next <== 0;}
+CASE (1) { state_steal(1, fromSMID, toSMID); sStage[toSMID].next <== 1;}
+CASE (2) { state_steal(2, fromSMID, toSMID); sStage[toSMID].next <== 2;}
+CASE (3) { state_steal(3, fromSMID, toSMID); sStage[toSMID].next <== 3;}
+CASE (4) { state_steal(4, fromSMID, toSMID); sStage[toSMID].next <== 4;}
+CASE (5) { state_steal(5, fromSMID, toSMID); sStage[toSMID].next <== 5;}
+CASE (6) { state_steal(6, fromSMID, toSMID); sStage[toSMID].next <== 6;}
+CASE (7) { state_steal(7, fromSMID, toSMID); sStage[toSMID].next <== 7;}
+CASE (8) { state_steal(8, fromSMID, toSMID); sStage[toSMID].next <== 9;}
+CASE (9) { state_steal(9, fromSMID, toSMID); sStage[toSMID].next <== 11;}
+CASE (10) { state_steal(10, fromSMID, toSMID); sStage[toSMID].next <== 13;}
+CASE (11) { state_steal(11, fromSMID, toSMID); sStage[toSMID].next <== 15;}
+CASE (12) { state_steal(12, fromSMID, toSMID); sStage[toSMID].next <== 17;}
+CASE (13) { state_steal(13, fromSMID, toSMID); sStage[toSMID].next <== 19;}
+CASE (14) { state_steal(14, fromSMID, toSMID); sStage[toSMID].next <== 21;}
+CASE (15) { state_steal(15, fromSMID, toSMID); sStage[toSMID].next <== 23;}
+OTHERWISE {
+				debug.simPrintf("steal on stage 16+ from %d to %d\n",fromSMID, toSMID);
+			}
+		}
+		// Set flag from recover.
+		sFlagRecover[toSMID].next <== true;
+
+		sMode.get(toSMID).next <== Modes.GUESS_STAGE_BYTE;
+		//sMode[toSMID].next <== Modes.GUESS_STAGE_BYTE;
+	}
+
+
+private void state_pop(int realstage, int SMID) {
+// Recover C.
+ksC[SMID][path[realstage][0]].next <== recS_C[SMID][realstage][path[realstage][0]];
+// Recover last compatible byte.
+sNextGuessIndex[SMID].next <== recS_sNextGuessIndex[SMID][realstage];
+// Recover last n0[SMID].
+sCurrentN0[SMID].next <== recS_n0[SMID][realstage];
+// Recover last n1[SMID].
+sCurrentN1[SMID].next <== recS_n1[SMID][realstage];
+romBetterGuess[SMID].address <== realstage * 256 + recS_sNextGuessIndex[SMID][realstage];
+}
+
+	private void state_steal(int realstage, int fromSMID, int toSMID) {
+		debug.simPrintf("stealing....from %d to %d\n", fromSMID, toSMID);
+		//Todo:: maybe necessary to copy recovery stack?!
+		// Recover C.
+		for(int i=0; i<KEY_SIZE; i++) {
+			ksC[toSMID][i].next <== recS_C[fromSMID][realstage][i];
+			//setTo2DArray(toSMID, i, recS_C[fromSMID][realstage][i], ksC);
+
+		}
+		// Recover last compatible byte.
+
+		sNextGuessIndex[toSMID].next <== recS_sNextGuessIndex[fromSMID][realstage];
+		// Recover last n0.
+		sCurrentN0[toSMID].next <== recS_n0[fromSMID][realstage];
+		// Recover last n1.
+		sCurrentN1[toSMID].next <== recS_n1[fromSMID][realstage];
+
+romBetterGuess[toSMID].address <== realstage * 256 + recS_sNextGuessIndex[fromSMID][realstage];
+
+
+		bottomOfStack[toSMID].next <== bottomOfStack[fromSMID];
+		bottomOfStack[fromSMID].next <== bottomOfStack[fromSMID]+1;
+		topOfStack[toSMID].next <== bottomOfStack[fromSMID];
+		idleNoResult[toSMID].next <== false;
+	}
+private void state_push(int stage, int SMID) {
+// Save C.
+for(int i=0; i<KEY_SIZE; i++) {
+	recS_C[SMID][stage][i].next <== ksC[SMID][i];
+}
+recS_C[SMID][stage][path[stage][0]].next <== sValueBackupOnPush[SMID];
+// Save current compatible byte.
+recS_sNextGuessIndex[SMID][stage].next <== sNextGuessIndex[SMID];
+// Save current n0[SMID].
+recS_n0[SMID][stage].next <== sCurrentN0[SMID];
+// Save current n1[SMID].
+recS_n1[SMID][stage].next <== sCurrentN1[SMID];
+
+//		debug.simPrintf(" OOO %d + %d = %d ------- %d + %d = %d \n", sCurrentN0[SMID], n0[SMID], sCurrentN0[SMID]+n0[SMID], sCurrentN1[SMID], n1[SMID], sCurrentN1[SMID]+n1[SMID]);
+debug.simPrintf("Stage %d push - Next guess: %d\n", stage, romBetterGuess[SMID].dataOut);
+if (stage < 15){
+  ksC[SMID][path[stage+1][0]].next <== romBetterGuess[SMID].dataOut;
+  romBetterGuess[SMID].address <== 256*(stage+1) + 1;
+  }
+}
+
+// Fixed path for order of tree computation.
+private final int[][] path = {{ 34}, 		//0
+{ 50, 47}, 		//1
+{ 66, 63, 59}, 		//2
+{ 18, 31, 43, 55}, 		//3
+{ 82, 79, 75, 71, 67}, 		//4
+{ 98, 95, 91, 87, 83, 76}, 		//5
+{ 114, 111, 107, 103, 99, 92, 88}, 		//6
+{ 130, 127, 123, 119, 115, 108, 104, 100}, 		//7
+{ 146, 143, 139, 135, 131, 124, 120, 116, 112}, 		//8
+{ 162, 159, 155, 151, 147, 140, 136, 132, 128, 125}, 		//9
+{ 2, 15, 27, 39, 51, 60, 72, 84, 96, 109, 121}, 		//10
+{ 175, 171, 167, 163, 156, 152, 148, 144, 141, 137, 133}, 		//11
+{ 129, 117, 105, 93, 80, 68, 56, 44, 35, 23, 11}, 		//12
+{ 126, 113, 101, 89, 77, 64, 52, 40, 28, 19, 7}, 		//13
+{ 122, 110, 97, 85, 73, 61, 48, 36, 24, 12, 3}, 		//14
+{ 172, 168, 164, 160, 157, 153, 149, 145, 142, 138, 134}	};		//15
+/**
+ * Substitution box of type int to fit into ROM.
+ */
+private final int[] sbox = {
+    // 0    1       2       3       4       5       6       7       8       9       A       B       C       D       E       F
+	99, 	124, 	119, 	123, 	242, 	107, 	111, 	197, 	48, 	1, 		103, 	43, 	254, 	215, 	171, 	118, // 0
+	202, 	130, 	201, 	125, 	250, 	89, 	71, 	240, 	173, 	212, 	162, 	175, 	156, 	164, 	114, 	192, // 1
+	183, 	253, 	147, 	38, 	54, 	63, 	247, 	204, 	52, 	165, 	229, 	241, 	113, 	216, 	49, 	21,  // 2
+	4, 		199, 	35, 	195, 	24, 	150, 	5, 		154, 	7, 		18, 	128, 	226, 	235, 	39, 	178, 	117, // 3
+	9, 		131, 	44, 	26, 	27, 	110, 	90, 	160, 	82, 	59, 	214, 	179, 	41, 	227, 	47, 	132, // 4
+	83, 	209, 	0, 		237, 	32, 	252, 	177, 	91, 	106, 	203, 	190, 	57, 	74, 	76, 	88, 	207, // 5
+	208, 	239, 	170, 	251, 	67, 	77, 	51, 	133, 	69, 	249, 	2, 		127, 	80, 	60, 	159, 	168, // 6
+	81, 	163, 	64, 	143, 	146, 	157, 	56, 	245, 	188, 	182, 	218, 	33, 	16, 	255, 	243, 	210, // 7
+	205, 	12, 	19, 	236, 	95, 	151, 	68, 	23, 	196, 	167, 	126, 	61, 	100, 	93, 	25, 	115, // 8
+	96, 	129, 	79, 	220, 	34, 	42, 	144, 	136, 	70, 	238, 	184, 	20, 	222, 	94, 	11, 	219, // 9
+	224, 	50, 	58, 	10, 	73, 	6, 		36, 	92, 	194, 	211, 	172, 	98, 	145, 	149, 	228, 	121, // A
+	231, 	200, 	55, 	109, 	141, 	213, 	78, 	169, 	108, 	86, 	244, 	234, 	101, 	122, 	174, 	8,   // B
+	186, 	120, 	37, 	46, 	28, 	166, 	180, 	198, 	232, 	221, 	116, 	31, 	75, 	189, 	139, 	138, // C
+	112, 	62, 	181, 	102, 	72, 	3, 		246, 	14, 	97, 	53, 	87, 	185, 	134, 	193, 	29, 	158, // D
+	225, 	248, 	152, 	17, 	105, 	217, 	142, 	148, 	155, 	30, 	135, 	233, 	206, 	85, 	40, 	223, // E
+	140, 	161, 	137, 	13, 	191, 	230, 	66, 	104, 	65, 	153, 	45, 	15, 	176, 	84, 	187, 	22   // F
+};
+
+/**
+ * Inverse of substitution box of type int to fit into ROM.
+ */
+private final int[] unsbox = {
+    // 0    1       2       3       4       5       6       7       8       9       A       B       C       D       E       F
+	82,		9,		106,	213,	48,		54,		165,	56,		191,	64,		163,	158,	129,	243,	215,	251,
+	124,	227,	57,		130,	155,	47,		255,	135,	52,		142,	67,		68,		196,	222,	233,	203,
+	84,		123,	148,	50,		166,	194,	35,		61,		238,	76,		149,	11,		66,		250,	195,	78,
+	8,		46,		161,	102,	40,		217,	36,		178,	118,	91,		162,	73,		109,	139,	209,	37,
+	114,	248,	246,	100,	134,	104,	152,	22,		212,	164,	92,		204,	93,		101,	182,	146,
+	108,	112,	72,		80,		253,	237,	185,	218,	94,		21,		70,		87,		167,	141,	157,	132,
+	144,	216,	171,	0,		140,	188,	211,	10,		247,	228,	88,		5,		184,	179,	69,		6,
+	208,	44,		30,		143,	202,	63,		15,		2,		193,	175,	189,	3,		1,		19,		138,	107,
+	58,		145,	17,		65,		79,		103,	220,	234,	151,	242,	207,	206,	240,	180,	230,	115,
+	150,	172,	116,	34,		231,	173,	53,		133,	226,	249,	55,		232,	28,		117,	223,	110,
+	71,		241,	26,		113,	29,		41,		197,	137,	111,	183,	98,		14,		170,	24,		190,	27,
+	252,	86,		62,		75,		198,	210,	121,	32,		154,	219,	192,	254,	120,	205,	90,		244,
+	31,		221,	168,	51,		136,	7,		199,	49,		177,	18,		16,		89,		39,		128,	236,	95,
+	96,		81,		127,	169,	25,		181,	74,		13,		45,		229,	122,	159,	147,	201,	156,	239,
+	160,	224,	59,		77,		174,	42,		245,	176,	200,	235,	187,	60,		131,	83,		153,	97,
+	23,		43,		4,		126,	186,	119,	214,	38,		225,	105,	20,		99,		85,		33,		12,		125
+};
+
+//	Round	constants.
+	private	final	int[]	rcon	=	{
+	141,	1,		2,		4,		8,		16,		32,		64,		128,	27,		54,		108,	216,	171,	77,		154,
+	47,		94,		188,	99,		198,	151,	53,		106,	212,	179,	125,	250,	239,	197,	145,	57,
+	114,	228,	211,	189,	97,		194,	159,	37,		74,		148,	51,		102,	204,	131,	29,		58,
+	116,	232,	203,	141,	1,		2,		4,		8,		16,		32,		64,		128,	27,		54,		108,	216,
+	171,	77,		154,	47,		94,		188,	99,		198,	151,	53,		106,	212,	179,	125,	250,	239,
+	197,	145,	57,		114,	228,	211,	189,	97,		194,	159,	37,		74,		148,	51,		102,	204,
+	131,	29,		58,		116,	232,	203,	141,	1,		2,		4,		8,		16,		32,		64,		128,	27,
+	54,		108,	216,	171,	77,		154,	47,		94,		188,	99,		198,	151,	53,		106,	212,	179,
+	125,	250,	239,	197,	145,	57,		114,	228,	211,	189,	97,		194,	159,	37,		74,		148,
+	51,		102,	204,	131,	29,		58,		116,	232,	203,	141,	1,		2,		4,		8,		16,		32,
+	64,		128,	27,		54,		108,	216,	171,	77,		154,	47,		94,		188,	99,		198,	151,	53,
+	106,	212,	179,	125,	250,	239,	197,	145,	57,		114,	228,	211,	189,	97,		194,	159,
+	37,		74,		148,	51,		102,	204,	131,	29,		58,		116,	232,	203,	141,	1,		2,		4,
+	8,		16,		32,		64,		128,	27,		54,		108,	216,	171,	77,		154,	47,		94,		188,	99,
+	198,	151,	53,		106,	212,	179,	125,	250,	239,	197,	145,	57,		114,	228,	211,	189,
+	97,		194,	159,	37,		74,		148,	51,		102,	204,	131,	29,		58,		116,	232,	203,	141
+	};
+
+}
