@@ -7,8 +7,8 @@ Stealing* techniques as well as *Instance-Specific Hardware Designs* to address
 particularly demanding problem instances.
 
 For more information visit our project website at
-https://pc2.uni-paderborn.de/coldboot and refer to our scientific publications
-listed below.
+https://pc2.uni-paderborn.de/go/coldboot and refer to our scientific
+publications listed below.
 
 ## How to Use
 
