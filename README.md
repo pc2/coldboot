@@ -103,7 +103,7 @@ hardware design (see above).
 
 * H. Riebler, M. Lass, R. Mittendorf, T. Löcke, and C. Plessl  
   Efficient Branch and Bound on FPGAs using Work Stealing and Instance-Specific Designs  
-  ACM Trans. on Reconfigurable Technology and Systems (TRETS). 2017. Accepted for publication.
+  ACM Trans. on Reconfigurable Technology and Systems (TRETS). 10(3). Jun. 2017. Pages 24:1–24:23.
 
 * H. Riebler, T. Kenter, C. Plessl, and C. Sorge  
   Reconstructing AES Key Schedules from Decayed Memory with FPGAs  
